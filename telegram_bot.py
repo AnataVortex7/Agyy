@@ -116,6 +116,7 @@ def send_typing(chat_id):
         pass
 
 
+def send_document(chat_id, filepath):
     url = f"{API}/sendDocument"
     boundary = "----claudebotboundary"
     filename = os.path.basename(filepath)
