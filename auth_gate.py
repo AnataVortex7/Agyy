@@ -115,12 +115,15 @@ def main():
     else:
         sys.exit(1)
 
-    # Success: hand off to the real session (tmux + agy).
+    # Success: hand off to a real shell (tmux + bash), so folders/files can
+    # be managed AND agy can be launched, all from this one real terminal.
     # -A = attach if the session already exists, else create it.
+    # Run `agy` yourself whenever you want it; exiting agy drops you back
+    # to this same shell instead of closing the session.
     workspace = "/root/workspace"
     os.makedirs(workspace, exist_ok=True)
     os.chdir(workspace)
-    subprocess.run(["tmux", "new-session", "-A", "-s", "agent", "agy"])
+    subprocess.run(["tmux", "new-session", "-A", "-s", "agent", "-c", workspace, "bash"])
 
 if __name__ == "__main__":
     main()
