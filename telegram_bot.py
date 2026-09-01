@@ -51,7 +51,7 @@ cwd_by_chat = {}       # chat_id -> relative path under WORKSPACE
 awaiting_name = {}     # chat_id -> True while waiting for a typed folder name
 ai_sessions = {}       # chat_id -> AgySession
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[=>()][0-9A-Za-z]?")
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[=>()][0-9A-Za-z]?")
 
 AI_KEYBOARD = {
     "inline_keyboard": [
@@ -143,6 +143,25 @@ class AgySession:
         threading.Thread(target=self._reader, daemon=True).start()
         threading.Thread(target=self._flusher, daemon=True).start()
 
+    def _auto_respond(self, data):
+        """
+        Real terminals silently answer certain queries the moment they see
+        them (device attributes, mode requests, kitty keyboard protocol
+        queries). Our pty never answered these, so agy sat waiting forever.
+        We scan for known query sequences and write back a safe canned
+        answer immediately, so agy's handshake can complete.
+        """
+        # DECRQM - "is mode N set?" -> answer "not recognized" (0)
+        for m in re.finditer(rb"\x1b\[\?(\d+)\$p", data):
+            mode = m.group(1)
+            self.write_raw(b"\x1b[?" + mode + b";0$y")
+        # Primary Device Attributes query -> claim to be a basic VT220-ish terminal
+        if re.search(rb"\x1b\[c(?!\d)", data) or b"\x1b[0c" in data:
+            self.write_raw(b"\x1b[?1;2c")
+        # Kitty keyboard protocol "what flags are active?" -> answer "none"
+        if b"\x1b[?u" in data:
+            self.write_raw(b"\x1b[?0u")
+
     def _reader(self):
         while self.alive:
             try:
@@ -152,6 +171,7 @@ class AgySession:
                     if not data:
                         self.alive = False
                         break
+                    self._auto_respond(data)
                     self.buffer += data
                     self.last_data_time = time.time()
             except OSError:
