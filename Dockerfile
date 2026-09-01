@@ -24,7 +24,8 @@ COPY auth_gate.py /root/auth_gate.py
 COPY nginx.conf /root/nginx.conf
 COPY url_watcher.py /root/url_watcher.py
 COPY oauth_link.html /root/oauth_link.html
-RUN chmod +x /root/entrypoint.sh /root/auth_gate.py /root/url_watcher.py
+COPY telegram_bot.py /root/telegram_bot.py
+RUN chmod +x /root/entrypoint.sh /root/auth_gate.py /root/url_watcher.py /root/telegram_bot.py
 
 # NOTE: No persistent volume on Koyeb's free tier. All state (agy login,
 # workspace files) lives in the container's local filesystem and is LOST
