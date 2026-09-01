@@ -241,11 +241,18 @@ def snapshot():
     build_archive() would tar up. Cheap enough to poll every few
     seconds; any add/edit/delete anywhere in it changes the signature -
     including agy writing its login/session files the moment a login
-    completes, so login is backed up automatically too, not just files."""
+    completes, so login is backed up automatically too, not just files.
+    Directories are recorded too (not just files inside them) so an
+    empty new folder still counts as a change."""
     sig = {}
 
     def add_dir(path):
         for dirpath, _dirs, files in os.walk(path):
+            try:
+                st = os.stat(dirpath)
+                sig[dirpath] = ("dir", st.st_mtime_ns)
+            except OSError:
+                pass
             for f in files:
                 fp = os.path.join(dirpath, f)
                 try:
@@ -287,6 +294,13 @@ def watch():
         f"{DEBOUNCE_SECONDS}s after things settle "
         f"(safety-net backup at least every {MAX_INTERVAL_MINUTES} min)."
     )
+    if not (BOT_TOKEN and GROUP_ID):
+        log("TELEGRAM_BACKUP_GROUP_ID or TELEGRAM_BOT_TOKEN not set - watcher has nothing to do.")
+        return
+    notify(
+        f"\U0001F440 Backup watcher is live - checking every {POLL_SECONDS}s, "
+        f"backs up ~{DEBOUNCE_SECONDS}s after a change settles."
+    )
     last_backed_up_sig = snapshot()
     last_seen_sig = last_backed_up_sig
     last_change_time = None
@@ -309,6 +323,7 @@ def watch():
         overdue = (time.time() - last_backup_time) >= MAX_INTERVAL_MINUTES * 60
 
         if (pending_change and settled) or (pending_change and overdue):
+            log(f"change detected ({len(last_seen_sig)} tracked paths) - backing up...")
             try:
                 if send_backup():
                     last_backed_up_sig = last_seen_sig
