@@ -100,7 +100,11 @@ def answer_callback(callback_id, text=None):
     params = {"callback_query_id": callback_id}
     if text:
         params["text"] = text
-    api_call("answerCallbackQuery", params)
+    try:
+        api_call("answerCallbackQuery", params)
+    except Exception:
+        pass  # query may be stale/expired (e.g. during backlog replay) -
+              # that's fine, the real button action below still runs
 
 def send_document(chat_id, filepath):
     url = f"{API}/sendDocument"
