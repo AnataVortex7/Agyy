@@ -52,7 +52,18 @@ ai_folder = {}         # chat_id -> absolute folder path AI is scoped to (AI mod
 ai_process = {}        # chat_id -> subprocess.Popen currently running for this chat's AI call
 ai_fresh = {}          # chat_id -> True to start a brand-new agy conversation (omit -c) on next message
 
-AI_MODEL_FLAGS = os.environ.get("AI_MODEL_FLAGS", "--model gemini-2.5-pro --effort high").split()
+AI_MODEL_FLAGS = os.environ.get("AI_MODEL_FLAGS", "--model gemini-3.1-pro --effort high").split()
+
+MODEL_OPTIONS = [
+    ("Gemini 3.7 Flash (High)", ["--model", "gemini-3.7-flash", "--effort", "high"]),
+    ("Gemini 3.6 Flash (Medium)", ["--model", "gemini-3.6-flash", "--effort", "medium"]),
+    ("Gemini 3.1 Pro (High) \u2b50 default", ["--model", "gemini-3.1-pro", "--effort", "high"]),
+    ("Claude Sonnet 4.6 (Thinking)", ["--model", "claude-sonnet-4.6", "--effort", "high"]),
+    ("Claude Opus 4.6 (Thinking)", ["--model", "claude-opus-4.6", "--effort", "high"]),
+    ("GPT-OSS 120B (Medium)", ["--model", "gpt-oss-120b", "--effort", "medium"]),
+]
+
+ai_model_flags = {}    # chat_id -> flags list currently selected (falls back to AI_MODEL_FLAGS)
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[=>()][0-9A-Za-z]?")
 
@@ -70,6 +81,7 @@ def _update_timestamp(update):
 
 AI_KEYBOARD = {
     "inline_keyboard": [
+        [{"text": "\u2699\ufe0f Switch Model", "callback_data": "switchmodel"}],
         [{"text": "\U0001F195 New chat (forget history here)", "callback_data": "ai_new"}],
         [{"text": "\U0001F6D1 Stop AI", "callback_data": "stopai"}],
     ]
@@ -203,7 +215,7 @@ def run_ai_message(chat_id, text):
         send_message(chat_id, "\u23F3 AI is still answering your previous message, please wait...")
         return
 
-    args = ["agy"] + AI_MODEL_FLAGS
+    args = ["agy"] + ai_model_flags.get(chat_id, AI_MODEL_FLAGS)
     if not ai_fresh.pop(chat_id, False):
         args.append("-c")  # continue this folder's conversation history
     args += ["--print-timeout", "30m", "--dangerously-skip-permissions", "--add-dir", folder, "-p", text]
@@ -286,6 +298,19 @@ def show_menu(chat_id):
 
 # ---------- action handlers ----------
 
+def model_keyboard():
+    rows = []
+    for i, (label, _flags) in enumerate(MODEL_OPTIONS):
+        rows.append([{"text": label, "callback_data": f"model:{i}"}])
+    return {"inline_keyboard": rows}
+
+def current_model_label(chat_id):
+    flags = ai_model_flags.get(chat_id, AI_MODEL_FLAGS)
+    for label, f in MODEL_OPTIONS:
+        if f == flags:
+            return label
+    return " ".join(flags)
+
 def handle_callback(callback):
     chat_id = callback["message"]["chat"]["id"]
     data = callback["data"]
@@ -310,6 +335,18 @@ def handle_callback(callback):
         if chat_id in ai_folder:
             ai_fresh[chat_id] = True
             send_message(chat_id, "\U0001F195 Next message starts a brand-new AI conversation in this folder.")
+        return
+
+    if data == "switchmodel":
+        send_message(chat_id, f"Current model: {current_model_label(chat_id)}\n\nPick a model:", model_keyboard())
+        return
+
+    if data.startswith("model:"):
+        idx = int(data.split(":")[1])
+        if 0 <= idx < len(MODEL_OPTIONS):
+            label, flags = MODEL_OPTIONS[idx]
+            ai_model_flags[chat_id] = flags
+            send_message(chat_id, f"\u2705 Model set to: {label}", AI_KEYBOARD if chat_id in ai_folder else None)
         return
 
     if data == "up":
@@ -398,6 +435,10 @@ def process_update(update):
         show_menu(chat_id)
         return
 
+    if text == "/model":
+        send_message(chat_id, f"Current model: {current_model_label(chat_id)}\n\nPick a model:", model_keyboard())
+        return
+
     if text == "/backup":
         send_message(chat_id, "Backing up workspace + agy login to the Telegram group...")
         def _run_backup():
@@ -444,6 +485,7 @@ def setup_menu_button():
     try:
         api_call("setMyCommands", {"commands": [
             {"command": "menu", "description": "Show the folder browser"},
+            {"command": "model", "description": "Switch AI model"},
             {"command": "stopai", "description": "Stop the running AI session"},
             {"command": "backup", "description": "Backup workspace + agy login now"},
             {"command": "help", "description": "Show this menu"},
