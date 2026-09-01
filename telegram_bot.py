@@ -53,6 +53,18 @@ ai_sessions = {}       # chat_id -> AgySession
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[=>()][0-9A-Za-z]?")
 
+STALE_UPDATE_SECONDS = 10  # updates older than this (piled up while the bot
+                           # was offline/redeploying) get dropped instead of
+                           # executed - only fresh, live commands ever run
+
+def _update_timestamp(update):
+    """Unix timestamp of a plain message update, or None if not applicable.
+    (callback_query has no tap-time field of its own - its .message.date is
+    when the menu/button was originally posted, not when it was tapped, so
+    we deliberately don't stale-filter callbacks by that.)"""
+    msg = update.get("message")
+    return msg.get("date") if msg else None
+
 AI_KEYBOARD = {
     "inline_keyboard": [
         [
@@ -106,7 +118,13 @@ def answer_callback(callback_id, text=None):
         pass  # query may be stale/expired (e.g. during backlog replay) -
               # that's fine, the real button action below still runs
 
-def send_document(chat_id, filepath):
+def send_typing(chat_id):
+    try:
+        api_call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+    except Exception:
+        pass
+
+
     url = f"{API}/sendDocument"
     boundary = "----claudebotboundary"
     filename = os.path.basename(filepath)
@@ -146,6 +164,16 @@ class AgySession:
         os.close(slave_fd)
         threading.Thread(target=self._reader, daemon=True).start()
         threading.Thread(target=self._flusher, daemon=True).start()
+        threading.Thread(target=self._typing_heartbeat, daemon=True).start()
+
+    def _typing_heartbeat(self):
+        # Keeps a "typing..." indicator showing in Telegram the whole time
+        # this AI session is alive, so it's obvious agy is running/working
+        # rather than stuck. Telegram's typing indicator auto-expires after
+        # ~5s, so we resend every 4s.
+        while self.alive:
+            send_typing(self.chat_id)
+            time.sleep(4)
 
     def _auto_respond(self, data):
         """
@@ -338,6 +366,14 @@ def handle_callback(callback):
 
 def run_command_here(chat_id, command):
     cwd = get_cwd_path(chat_id)
+    stop_typing = threading.Event()
+
+    def _typing_loop():
+        while not stop_typing.is_set():
+            send_typing(chat_id)
+            stop_typing.wait(4)
+
+    threading.Thread(target=_typing_loop, daemon=True).start()
     try:
         result = subprocess.run(
             command, shell=True, cwd=cwd,
@@ -347,6 +383,8 @@ def run_command_here(chat_id, command):
         send_message(chat_id, out.strip() or f"(done, exit code {result.returncode})")
     except subprocess.TimeoutExpired:
         send_message(chat_id, "Command timed out after 120s.")
+    finally:
+        stop_typing.set()
     show_menu(chat_id)
 
 def handle_file(chat_id, file_id, filename):
@@ -404,11 +442,6 @@ def process_update(update):
         show_menu(chat_id)
         return
 
-    session = ai_sessions.get(chat_id)
-    if session and session.alive:
-        session.write_text(text)
-        return
-
     if awaiting_name.get(chat_id):
         awaiting_name.pop(chat_id, None)
         name = text.strip()
@@ -417,6 +450,11 @@ def process_update(update):
         rel = cwd_by_chat.get(chat_id, "")
         set_cwd_rel(chat_id, f"{rel}/{name}" if rel else name)
         show_menu(chat_id)
+        return
+
+    session = ai_sessions.get(chat_id)
+    if session and session.alive:
+        session.write_text(text)
         return
 
     run_command_here(chat_id, text)
@@ -446,12 +484,23 @@ def main():
 
     setup_menu_button()
 
+    if ALLOWED_USER_ID:
+        try:
+            send_message(int(ALLOWED_USER_ID), "\U0001F7E2 Bot (re)started and ready. Send /start to begin.")
+        except Exception as e:
+            print(f"Could not send startup greeting: {e}")
+
     offset = 0
     while True:
         try:
             updates = api_call("getUpdates", {"offset": offset, "timeout": 30}, timeout=40)
             for update in updates.get("result", []):
                 offset = update["update_id"] + 1
+
+                ts = _update_timestamp(update)
+                if ts is not None and (time.time() - ts) > STALE_UPDATE_SECONDS:
+                    continue  # old backlog (queued while bot was offline) - drop it, don't run it
+
                 try:
                     process_update(update)
                 except Exception as e:
