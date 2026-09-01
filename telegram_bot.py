@@ -31,10 +31,8 @@ Required env vars (Koyeb secrets, same as PASSWORD):
 """
 import json
 import os
-import pty
+import queue
 import re
-import select
-import signal
 import subprocess
 import threading
 import time
@@ -49,7 +47,12 @@ FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
 cwd_by_chat = {}       # chat_id -> relative path under WORKSPACE
 awaiting_name = {}     # chat_id -> True while waiting for a typed folder name
-ai_sessions = {}       # chat_id -> AgySession
+
+ai_folder = {}         # chat_id -> absolute folder path AI is scoped to (AI mode active if present)
+ai_process = {}        # chat_id -> subprocess.Popen currently running for this chat's AI call
+ai_fresh = {}          # chat_id -> True to start a brand-new agy conversation (omit -c) on next message
+
+AI_MODEL_FLAGS = os.environ.get("AI_MODEL_FLAGS", "--model gemini-2.5-pro --effort high").split()
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[=>()][0-9A-Za-z]?")
 
@@ -67,19 +70,7 @@ def _update_timestamp(update):
 
 AI_KEYBOARD = {
     "inline_keyboard": [
-        [
-            {"text": "\u23CE Enter", "callback_data": "ai_enter"},
-            {"text": "\u2303\u23CE Ctrl+Enter", "callback_data": "ai_ctrlenter"},
-        ],
-        [
-            {"text": "\u21E7\u2191 Shift+Up", "callback_data": "ai_shift_up"},
-            {"text": "\u21E7\u2193 Shift+Down", "callback_data": "ai_shift_down"},
-        ],
-        [
-            {"text": "\u2303C", "callback_data": "ai_ctrlc"},
-            {"text": "\u2303D", "callback_data": "ai_ctrld"},
-            {"text": "Esc", "callback_data": "ai_esc"},
-        ],
+        [{"text": "\U0001F195 New chat (forget history here)", "callback_data": "ai_new"}],
         [{"text": "\U0001F6D1 Stop AI", "callback_data": "stopai"}],
     ]
 }
@@ -148,101 +139,99 @@ def send_typing(chat_id):
     with urllib.request.urlopen(req, timeout=120) as resp:
         return json.loads(resp.read())
 
-# ---------- interactive AI (agy) session, backed by a real pty ----------
+# ---------- AI (agy) calls: one-shot subprocess per message, not a live pty ----------
+#
+# Each message is answered with a single `agy ... -c --dangerously-skip-permissions
+# --add-dir <folder> -p "<message>"` call. This means:
+#  - No permission prompts ever block the bot (--dangerously-skip-permissions).
+#  - No separate "login state" to keep in sync: every call is a fresh process
+#    that reads the same on-disk agy config as a terminal login would, so
+#    logging in once (in ttyd or here) is enough everywhere.
+#  - Much lighter than a persistent pty session (no idle threads, no terminal
+#    emulation), which matters a lot on a 0.1 vCPU / 512MB free instance.
 
-class AgySession:
-    def __init__(self, chat_id, cwd):
-        self.chat_id = chat_id
-        self.alive = True
-        self.buffer = b""
-        self.last_data_time = time.time()
-        self.master_fd, slave_fd = pty.openpty()
-        self.proc = subprocess.Popen(
-            ["agy"], cwd=cwd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-            preexec_fn=os.setsid, close_fds=True,
-        )
-        os.close(slave_fd)
-        threading.Thread(target=self._reader, daemon=True).start()
-        threading.Thread(target=self._flusher, daemon=True).start()
-        threading.Thread(target=self._typing_heartbeat, daemon=True).start()
-
-    def _typing_heartbeat(self):
-        # Keeps a "typing..." indicator showing in Telegram the whole time
-        # this AI session is alive, so it's obvious agy is running/working
-        # rather than stuck. Telegram's typing indicator auto-expires after
-        # ~5s, so we resend every 4s.
-        while self.alive:
-            send_typing(self.chat_id)
-            time.sleep(4)
-
-    def _auto_respond(self, data):
-        """
-        Real terminals silently answer certain queries the moment they see
-        them (device attributes, mode requests, kitty keyboard protocol
-        queries). Our pty never answered these, so agy sat waiting forever.
-        We scan for known query sequences and write back a safe canned
-        answer immediately, so agy's handshake can complete.
-        """
-        # DECRQM - "is mode N set?" -> answer "not recognized" (0)
-        for m in re.finditer(rb"\x1b\[\?(\d+)\$p", data):
-            mode = m.group(1)
-            self.write_raw(b"\x1b[?" + mode + b";0$y")
-        # Primary Device Attributes query -> claim to be a basic VT220-ish terminal
-        if re.search(rb"\x1b\[c(?!\d)", data) or b"\x1b[0c" in data:
-            self.write_raw(b"\x1b[?1;2c")
-        # Kitty keyboard protocol "what flags are active?" -> answer "none"
-        if b"\x1b[?u" in data:
-            self.write_raw(b"\x1b[?0u")
-
-    def _reader(self):
-        while self.alive:
-            try:
-                ready, _, _ = select.select([self.master_fd], [], [], 1.0)
-                if ready:
-                    data = os.read(self.master_fd, 4096)
-                    if not data:
-                        self.alive = False
-                        break
-                    self._auto_respond(data)
-                    self.buffer += data
-                    self.last_data_time = time.time()
-            except OSError:
-                self.alive = False
+def _ai_reader(proc, q):
+    try:
+        while True:
+            b = proc.stdout.read(1)
+            if not b:
                 break
+            q.put(b)
+    finally:
+        q.put(b"")
 
-    def _flusher(self):
-        while self.alive:
-            time.sleep(0.8)
-            if self.buffer and (time.time() - self.last_data_time) > 0.8:
-                raw = self.buffer
-                self.buffer = b""
-                text = ANSI_RE.sub("", raw.decode(errors="ignore")).replace("\r", "")
-                text = text.strip()
-                if text:
-                    send_message(self.chat_id, text, AI_KEYBOARD)
-        if self.buffer:
-            text = ANSI_RE.sub("", self.buffer.decode(errors="ignore")).replace("\r", "").strip()
-            if text:
-                send_message(self.chat_id, text)
-        send_message(self.chat_id, "(AI session ended)")
-        ai_sessions.pop(self.chat_id, None)
+def _ai_send_buffer(chat_id, buffer):
+    if not buffer:
+        return
+    text = ANSI_RE.sub("", buffer.decode("utf-8", errors="ignore")).replace("\r", "").strip()
+    buffer.clear()
+    if text:
+        send_message(chat_id, text)
 
-    def write_text(self, text):
-        os.write(self.master_fd, (text + "\n").encode())
-
-    def write_raw(self, raw_bytes):
-        os.write(self.master_fd, raw_bytes)
-
-    def stop(self):
-        self.alive = False
+def _ai_flusher(chat_id, proc, q):
+    buffer = bytearray()
+    last_send = time.time()
+    last_typing = 0.0
+    while proc.poll() is None or not q.empty():
         try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            b = q.get(timeout=0.2)
+            if not b:
+                break
+            buffer += b
+            if len(buffer) >= 3500:
+                _ai_send_buffer(chat_id, buffer)
+                last_send = time.time()
+        except queue.Empty:
+            now = time.time()
+            if buffer and now - last_send > 0.8:
+                _ai_send_buffer(chat_id, buffer)
+                last_send = now
+            if now - last_typing > 4.0:
+                send_typing(chat_id)
+                last_typing = now
+    _ai_send_buffer(chat_id, buffer)
+    ai_process.pop(chat_id, None)
+    send_message(chat_id, "\u2705 AI finished. Type your next message.", AI_KEYBOARD)
+
+def run_ai_message(chat_id, text):
+    folder = ai_folder.get(chat_id)
+    if not folder:
+        send_message(chat_id, "AI is not active here. Tap \U0001F916 Start AI here first.")
+        return
+    if ai_process.get(chat_id) is not None:
+        send_message(chat_id, "\u23F3 AI is still answering your previous message, please wait...")
+        return
+
+    args = ["agy"] + AI_MODEL_FLAGS
+    if not ai_fresh.pop(chat_id, False):
+        args.append("-c")  # continue this folder's conversation history
+    args += ["--print-timeout", "30m", "--dangerously-skip-permissions", "--add-dir", folder, "-p", text]
+
+    try:
+        proc = subprocess.Popen(
+            args, cwd=folder,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+    except Exception as e:
+        send_message(chat_id, f"Could not start AI: {e}")
+        return
+
+    ai_process[chat_id] = proc
+    send_typing(chat_id)
+    q = queue.Queue()
+    threading.Thread(target=_ai_reader, args=(proc, q), daemon=True).start()
+    threading.Thread(target=_ai_flusher, args=(chat_id, proc, q), daemon=True).start()
+
+def stop_ai(chat_id):
+    proc = ai_process.pop(chat_id, None)
+    if proc:
+        try:
+            proc.terminate()
         except Exception:
             pass
-        try:
-            os.close(self.master_fd)
-        except Exception:
-            pass
+    ai_folder.pop(chat_id, None)
+    ai_fresh.pop(chat_id, None)
 
 # ---------- folder helpers ----------
 
@@ -301,48 +290,25 @@ def handle_callback(callback):
     data = callback["data"]
     answer_callback(callback["id"])
 
-    session = ai_sessions.get(chat_id)
-
     if data == "startai":
-        if session and session.alive:
-            send_message(chat_id, "AI is already running here.", AI_KEYBOARD)
+        if chat_id in ai_folder:
+            send_message(chat_id, "AI is already active here.", AI_KEYBOARD)
         else:
             cwd = get_cwd_path(chat_id)
-            ai_sessions[chat_id] = AgySession(chat_id, cwd)
-            send_message(chat_id, "AI started. Just type normally to chat with it.", AI_KEYBOARD)
+            ai_folder[chat_id] = cwd
+            ai_fresh[chat_id] = False
+            send_message(chat_id, f"\U0001F916 AI ready in this folder:\n{cwd}\n\nJust type your message \u2014 no need to log in again, it uses the same login.", AI_KEYBOARD)
         return
 
     if data == "stopai":
-        if session:
-            session.stop()
-            ai_sessions.pop(chat_id, None)
+        stop_ai(chat_id)
         show_menu(chat_id)
         return
 
-    if data == "ai_enter" and session:
-        session.write_raw(b"\n")
-        return
-    if data == "ai_ctrlenter" and session:
-        # Plain terminals can't literally distinguish Ctrl+Enter from Enter
-        # (both are historically just carriage return). Modern apps that
-        # DO distinguish it (kitty keyboard protocol / xterm "CSI u" mode)
-        # expect this escape sequence for Ctrl+Enter:
-        session.write_raw(b"\x1b[13;5u")
-        return
-    if data == "ai_shift_up" and session:
-        session.write_raw(b"\x1b[1;2A")
-        return
-    if data == "ai_shift_down" and session:
-        session.write_raw(b"\x1b[1;2B")
-        return
-    if data == "ai_ctrlc" and session:
-        session.write_raw(b"\x03")
-        return
-    if data == "ai_ctrld" and session:
-        session.write_raw(b"\x04")
-        return
-    if data == "ai_esc" and session:
-        session.write_raw(b"\x1b")
+    if data == "ai_new":
+        if chat_id in ai_folder:
+            ai_fresh[chat_id] = True
+            send_message(chat_id, "\U0001F195 Next message starts a brand-new AI conversation in this folder.")
         return
 
     if data == "up":
@@ -444,13 +410,11 @@ def process_update(update):
         return
 
     if text == "/stopai":
-        session = ai_sessions.get(chat_id)
-        if session:
-            session.stop()
-            ai_sessions.pop(chat_id, None)
-            send_message(chat_id, "AI session stopped.")
+        if chat_id in ai_folder:
+            stop_ai(chat_id)
+            send_message(chat_id, "AI stopped.")
         else:
-            send_message(chat_id, "No AI session running.")
+            send_message(chat_id, "No AI active here.")
         show_menu(chat_id)
         return
 
@@ -464,9 +428,8 @@ def process_update(update):
         show_menu(chat_id)
         return
 
-    session = ai_sessions.get(chat_id)
-    if session and session.alive:
-        session.write_text(text)
+    if chat_id in ai_folder:
+        run_ai_message(chat_id, text)
         return
 
     run_command_here(chat_id, text)
