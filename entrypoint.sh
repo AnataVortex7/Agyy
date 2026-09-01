@@ -25,4 +25,4 @@ python3 /root/telegram_bot.py &
 #    Every connection still runs auth_gate.py FIRST: it asks for the
 #    password, blocks the IP for 24h after 3 wrong tries, and only on
 #    success attaches/creates the tmux session running agy.
-ttyd -p 7681 -i 127.0.0.1 -W python3 /root/auth_gate.py
+ttyd -p 7681 -i 127.0.0.1 -t rendererType=dom -W python3 /root/auth_gate.py
