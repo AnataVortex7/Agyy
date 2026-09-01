@@ -431,6 +431,18 @@ def process_update(update):
         show_menu(chat_id)
         return
 
+    if text == "/backup":
+        send_message(chat_id, "Backing up workspace + agy login to the Telegram group...")
+        def _run_backup():
+            result = subprocess.run(
+                ["python3", "/root/backup.py", "once"],
+                capture_output=True, text=True, timeout=180,
+            )
+            out = (result.stdout or "") + (result.stderr or "")
+            send_message(chat_id, out.strip() or "Backup finished.")
+        threading.Thread(target=_run_backup, daemon=True).start()
+        return
+
     if text == "/stopai":
         session = ai_sessions.get(chat_id)
         if session:
@@ -469,6 +481,7 @@ def setup_menu_button():
         api_call("setMyCommands", {"commands": [
             {"command": "menu", "description": "Show the folder browser"},
             {"command": "stopai", "description": "Stop the running AI session"},
+            {"command": "backup", "description": "Backup workspace + agy login now"},
             {"command": "help", "description": "Show this menu"},
         ]})
         api_call("setChatMenuButton", {"menu_button": {"type": "commands"}})
