@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-Telegram remote-control bot for this container - button-driven version.
+Telegram remote-control bot for this container.
 
-How it works:
-  - /start shows a menu: buttons for each subfolder (tap to enter) and
-    each file (tap to download it back to you), plus action buttons.
-  - Tap "New folder", then type a name -> folder is created and entered.
-  - Once inside a folder, just type a normal message (no "/") and it
-    runs as a shell command right there (e.g. type "agy status").
-    The command's output is sent back, followed by the menu again.
-  - Send any file/photo -> saved straight into the currently selected
-    folder.
+Folder browsing (as before):
+  - /start shows buttons: folders (tap to enter), files (tap to download),
+    "New folder", "Up", "Refresh".
+  - Typing a plain message runs it as a one-shot shell command in the
+    current folder - UNLESS an AI session is active (see below).
 
-Only replies to TELEGRAM_ALLOWED_USER_ID; everyone else is ignored.
-Standard library only (urllib) - no extra pip/apt packages needed.
+AI chat (new):
+  - Tap "Start AI here" to launch `agy` as a REAL interactive session
+    (via a pseudo-terminal, same as running it in a real terminal)
+    inside the currently selected folder.
+  - Once started, every plain message you type is sent straight to
+    that running agy session, just like typing into a terminal - agy's
+    replies are streamed back to you as they appear.
+  - Buttons let you send the key-presses a keyboard would send:
+    Enter, Ctrl+C (interrupt), Ctrl+D (EOF/exit), Esc.
+    ("Shift" alone isn't a sendable key over a text protocol - it only
+    matters combined with another key, e.g. Shift+Enter for a newline
+    without submitting. If agy needs that, tell me and I'll add a
+    dedicated "newline without submit" button.)
+  - Tap "Stop AI" to end the session and go back to folder browsing.
+
+Only replies to TELEGRAM_ALLOWED_USER_ID. Standard library only.
 
 Required env vars (Koyeb secrets, same as PASSWORD):
   TELEGRAM_BOT_TOKEN       - from @BotFather
@@ -21,10 +31,14 @@ Required env vars (Koyeb secrets, same as PASSWORD):
 """
 import json
 import os
+import pty
+import re
+import select
+import signal
 import subprocess
+import threading
 import time
 import urllib.request
-import urllib.parse
 import mimetypes
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -33,8 +47,30 @@ WORKSPACE = "/root/workspace"
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
-cwd_by_chat = {}          # chat_id -> relative path under WORKSPACE
-awaiting_name = {}        # chat_id -> True while we're waiting for a typed folder name
+cwd_by_chat = {}       # chat_id -> relative path under WORKSPACE
+awaiting_name = {}     # chat_id -> True while waiting for a typed folder name
+ai_sessions = {}       # chat_id -> AgySession
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[=>()][0-9A-Za-z]?")
+
+AI_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "\u23CE Enter", "callback_data": "ai_enter"},
+            {"text": "\u2303\u23CE Ctrl+Enter", "callback_data": "ai_ctrlenter"},
+        ],
+        [
+            {"text": "\u21E7\u2191 Shift+Up", "callback_data": "ai_shift_up"},
+            {"text": "\u21E7\u2193 Shift+Down", "callback_data": "ai_shift_down"},
+        ],
+        [
+            {"text": "\u2303C", "callback_data": "ai_ctrlc"},
+            {"text": "\u2303D", "callback_data": "ai_ctrld"},
+            {"text": "Esc", "callback_data": "ai_esc"},
+        ],
+        [{"text": "\U0001F6D1 Stop AI", "callback_data": "stopai"}],
+    ]
+}
 
 # ---------- low-level Telegram API helpers ----------
 
@@ -46,17 +82,18 @@ def api_call(method, params, timeout=60):
         return json.loads(resp.read())
 
 def send_message(chat_id, text, keyboard=None):
-    params = {"chat_id": chat_id, "text": text or "(no output)"}
-    if keyboard:
-        params["reply_markup"] = keyboard
-    if len(params["text"]) > 4000:
-        full = params["text"]
-        for i in range(0, len(full), 4000):
-            chunk_params = {"chat_id": chat_id, "text": full[i:i + 4000]}
-            if keyboard and i + 4000 >= len(full):
-                chunk_params["reply_markup"] = keyboard
-            api_call("sendMessage", chunk_params)
+    text = text or "(no output)"
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            chunk = text[i:i + 4000]
+            params = {"chat_id": chat_id, "text": chunk}
+            if keyboard and i + 4000 >= len(text):
+                params["reply_markup"] = keyboard
+            api_call("sendMessage", params)
     else:
+        params = {"chat_id": chat_id, "text": text}
+        if keyboard:
+            params["reply_markup"] = keyboard
         api_call("sendMessage", params)
 
 def answer_callback(callback_id, text=None):
@@ -88,6 +125,72 @@ def send_document(chat_id, filepath):
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     with urllib.request.urlopen(req, timeout=120) as resp:
         return json.loads(resp.read())
+
+# ---------- interactive AI (agy) session, backed by a real pty ----------
+
+class AgySession:
+    def __init__(self, chat_id, cwd):
+        self.chat_id = chat_id
+        self.alive = True
+        self.buffer = b""
+        self.last_data_time = time.time()
+        self.master_fd, slave_fd = pty.openpty()
+        self.proc = subprocess.Popen(
+            ["agy"], cwd=cwd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            preexec_fn=os.setsid, close_fds=True,
+        )
+        os.close(slave_fd)
+        threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._flusher, daemon=True).start()
+
+    def _reader(self):
+        while self.alive:
+            try:
+                ready, _, _ = select.select([self.master_fd], [], [], 1.0)
+                if ready:
+                    data = os.read(self.master_fd, 4096)
+                    if not data:
+                        self.alive = False
+                        break
+                    self.buffer += data
+                    self.last_data_time = time.time()
+            except OSError:
+                self.alive = False
+                break
+
+    def _flusher(self):
+        while self.alive:
+            time.sleep(0.8)
+            if self.buffer and (time.time() - self.last_data_time) > 0.8:
+                raw = self.buffer
+                self.buffer = b""
+                text = ANSI_RE.sub("", raw.decode(errors="ignore")).replace("\r", "")
+                text = text.strip()
+                if text:
+                    send_message(self.chat_id, text, AI_KEYBOARD)
+        if self.buffer:
+            text = ANSI_RE.sub("", self.buffer.decode(errors="ignore")).replace("\r", "").strip()
+            if text:
+                send_message(self.chat_id, text)
+        send_message(self.chat_id, "(AI session ended)")
+        ai_sessions.pop(self.chat_id, None)
+
+    def write_text(self, text):
+        os.write(self.master_fd, (text + "\n").encode())
+
+    def write_raw(self, raw_bytes):
+        os.write(self.master_fd, raw_bytes)
+
+    def stop(self):
+        self.alive = False
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            os.close(self.master_fd)
+        except Exception:
+            pass
 
 # ---------- folder helpers ----------
 
@@ -124,6 +227,7 @@ def build_menu(chat_id):
         target = fname if not rel else f"{rel}/{fname}"
         rows.append([{"text": f"\U0001F4C4 {fname}", "callback_data": f"get:{target}"}])
 
+    rows.append([{"text": "\U0001F916 Start AI here", "callback_data": "startai"}])
     action_row = []
     if rel:
         action_row.append({"text": "\u2B06\uFE0F Up", "callback_data": "up"})
@@ -131,7 +235,7 @@ def build_menu(chat_id):
     action_row.append({"text": "\U0001F504 Refresh", "callback_data": "refresh"})
     rows.append(action_row)
 
-    text = f"{label}\n\nTap a folder to enter it, a file to download it.\nJust type a message to run it as a command here."
+    text = f"{label}\n\nTap a folder to enter, a file to download.\nType a message to run it as a command here, or tap Start AI to chat with agy."
     return text, {"inline_keyboard": rows}
 
 def show_menu(chat_id):
@@ -145,23 +249,62 @@ def handle_callback(callback):
     data = callback["data"]
     answer_callback(callback["id"])
 
+    session = ai_sessions.get(chat_id)
+
+    if data == "startai":
+        if session and session.alive:
+            send_message(chat_id, "AI is already running here.", AI_KEYBOARD)
+        else:
+            cwd = get_cwd_path(chat_id)
+            ai_sessions[chat_id] = AgySession(chat_id, cwd)
+            send_message(chat_id, "AI started. Just type normally to chat with it.", AI_KEYBOARD)
+        return
+
+    if data == "stopai":
+        if session:
+            session.stop()
+            ai_sessions.pop(chat_id, None)
+        show_menu(chat_id)
+        return
+
+    if data == "ai_enter" and session:
+        session.write_raw(b"\n")
+        return
+    if data == "ai_ctrlenter" and session:
+        # Plain terminals can't literally distinguish Ctrl+Enter from Enter
+        # (both are historically just carriage return). Modern apps that
+        # DO distinguish it (kitty keyboard protocol / xterm "CSI u" mode)
+        # expect this escape sequence for Ctrl+Enter:
+        session.write_raw(b"\x1b[13;5u")
+        return
+    if data == "ai_shift_up" and session:
+        session.write_raw(b"\x1b[1;2A")
+        return
+    if data == "ai_shift_down" and session:
+        session.write_raw(b"\x1b[1;2B")
+        return
+    if data == "ai_ctrlc" and session:
+        session.write_raw(b"\x03")
+        return
+    if data == "ai_ctrld" and session:
+        session.write_raw(b"\x04")
+        return
+    if data == "ai_esc" and session:
+        session.write_raw(b"\x1b")
+        return
+
     if data == "up":
         rel = cwd_by_chat.get(chat_id, "")
-        parent = os.path.dirname(rel)
-        set_cwd_rel(chat_id, parent)
+        set_cwd_rel(chat_id, os.path.dirname(rel))
         show_menu(chat_id)
-
     elif data == "refresh":
         show_menu(chat_id)
-
     elif data == "newfolder":
         awaiting_name[chat_id] = True
         send_message(chat_id, "Send the new folder's name as a message.")
-
     elif data.startswith("cd:"):
         set_cwd_rel(chat_id, data[3:])
         show_menu(chat_id)
-
     elif data.startswith("get:"):
         filepath = os.path.join(WORKSPACE, data[4:])
         if os.path.isfile(filepath):
@@ -221,9 +364,25 @@ def process_update(update):
     if not text:
         return
 
-    if text in ("/start", "/help"):
+    if text in ("/start", "/help", "/menu"):
         awaiting_name.pop(chat_id, None)
         show_menu(chat_id)
+        return
+
+    if text == "/stopai":
+        session = ai_sessions.get(chat_id)
+        if session:
+            session.stop()
+            ai_sessions.pop(chat_id, None)
+            send_message(chat_id, "AI session stopped.")
+        else:
+            send_message(chat_id, "No AI session running.")
+        show_menu(chat_id)
+        return
+
+    session = ai_sessions.get(chat_id)
+    if session and session.alive:
+        session.write_text(text)
         return
 
     if awaiting_name.get(chat_id):
@@ -236,8 +395,23 @@ def process_update(update):
         show_menu(chat_id)
         return
 
-    # any other plain text = run it as a command in the current folder
     run_command_here(chat_id, text)
+
+def setup_menu_button():
+    """
+    Registers a persistent menu (Telegram's chat-bar 'Menu' button, next
+    to the text field) so these are reachable without scrolling back to
+    the buttons in an old message.
+    """
+    try:
+        api_call("setMyCommands", {"commands": [
+            {"command": "menu", "description": "Show the folder browser"},
+            {"command": "stopai", "description": "Stop the running AI session"},
+            {"command": "help", "description": "Show this menu"},
+        ]})
+        api_call("setChatMenuButton", {"menu_button": {"type": "commands"}})
+    except Exception as e:
+        print(f"Could not set up chat menu button: {e}")
 
 def main():
     if not BOT_TOKEN:
@@ -245,6 +419,8 @@ def main():
         return
     if not ALLOWED_USER_ID:
         print("WARNING: TELEGRAM_ALLOWED_USER_ID not set - bot will ignore everyone.")
+
+    setup_menu_button()
 
     offset = 0
     while True:
