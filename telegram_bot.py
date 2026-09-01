@@ -180,6 +180,11 @@ def _ai_send_buffer(chat_id, buffer):
     buffer.clear()
     if text:
         send_message(chat_id, text)
+        # Telegram clears the "typing..." indicator the instant a message is
+        # sent, so without this the dots blink off after every chunk and
+        # only come back up to 4s later. Re-raise it immediately so it
+        # stays lit continuously while the AI keeps working.
+        send_typing(chat_id)
 
 def _ai_flusher(chat_id, proc, q):
     buffer = bytearray()
@@ -213,6 +218,7 @@ def run_ai_message(chat_id, text):
         return
     if ai_process.get(chat_id) is not None:
         send_message(chat_id, "\u23F3 AI is still answering your previous message, please wait...")
+        send_typing(chat_id)  # don't let the notice itself clear the dots
         return
 
     args = ["agy"] + ai_model_flags.get(chat_id, AI_MODEL_FLAGS)
@@ -439,18 +445,6 @@ def process_update(update):
         send_message(chat_id, f"Current model: {current_model_label(chat_id)}\n\nPick a model:", model_keyboard())
         return
 
-    if text == "/backup":
-        send_message(chat_id, "Backing up workspace + agy login to the Telegram group...")
-        def _run_backup():
-            result = subprocess.run(
-                ["python3", "/root/backup.py", "once"],
-                capture_output=True, text=True, timeout=180,
-            )
-            out = (result.stdout or "") + (result.stderr or "")
-            send_message(chat_id, out.strip() or "Backup finished.")
-        threading.Thread(target=_run_backup, daemon=True).start()
-        return
-
     if text == "/stopai":
         if chat_id in ai_folder:
             stop_ai(chat_id)
@@ -487,7 +481,6 @@ def setup_menu_button():
             {"command": "menu", "description": "Show the folder browser"},
             {"command": "model", "description": "Switch AI model"},
             {"command": "stopai", "description": "Stop the running AI session"},
-            {"command": "backup", "description": "Backup workspace + agy login now"},
             {"command": "help", "description": "Show this menu"},
         ]})
         api_call("setChatMenuButton", {"menu_button": {"type": "commands"}})
