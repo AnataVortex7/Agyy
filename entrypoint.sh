@@ -28,12 +28,13 @@ python3 /root/url_watcher.py &
 #    isn't set.
 python3 /root/telegram_bot.py &
 
-# 3b) Periodic backup loop: every BACKUP_INTERVAL_MINUTES (default 20),
-#     re-uploads workspace + agy login/config to the Telegram backup
-#     group so a redeploy never loses data. Does nothing if
+# 3b) Backup watcher: watches workspace + agy login/config for ANY
+#     change and uploads a fresh backup to the Telegram group within
+#     seconds of things settling (not on a fixed timer), so a redeploy
+#     can only ever lose a few seconds of work. Does nothing if
 #     TELEGRAM_BACKUP_GROUP_ID isn't set. Trigger one on-demand anytime
 #     with /backup in Telegram.
-python3 /root/backup.py loop &
+python3 /root/backup.py watch &
 
 # 4) ttyd now listens only on localhost:7681 (nginx forwards to it).
 #    Every connection still runs auth_gate.py FIRST: it asks for the

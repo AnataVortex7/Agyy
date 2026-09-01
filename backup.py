@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Periodic backup/restore of persistent state to a Telegram group.
+Change-triggered backup/restore of persistent state to a Telegram group.
 
 Koyeb's free tier has no persistent disk - everything in the container
 (workspace files, agy's login/session, this bot's IP-blocklist) is wiped
@@ -8,6 +8,13 @@ on every redeploy/restart. This script uses a Telegram group as free
 "storage": it tars up all state, uploads it as a document, and pins that
 message so the latest backup can always be found again (bots can't list
 chat history, but they CAN read the currently pinned message via getChat).
+
+Backups are NOT on a fixed timer. A lightweight watcher polls file
+mtimes/sizes every few seconds and fires a backup shortly after it sees
+things settle (workspace file added/changed/removed, agy login/session
+file written, etc.) - so a redeploy can only ever lose a few seconds of
+work, not up to a whole timer window. A long MAX_BACKUP_INTERVAL_MINUTES
+still runs as a safety net in case a change is ever somehow missed.
 
 Setup:
   1. Create a Telegram group (or reuse one) and add this bot to it.
@@ -18,12 +25,18 @@ Setup:
      or call https://api.telegram.org/bot<TOKEN>/getUpdates after
      posting in the group and look for "chat":{"id": ...}.
   4. Set Koyeb secrets:
-       TELEGRAM_BACKUP_GROUP_ID   - the group's chat id (e.g. -1001234567890)
-       BACKUP_INTERVAL_MINUTES    - optional, default 20
+       TELEGRAM_BACKUP_GROUP_ID       - the group's chat id (e.g. -1001234567890)
+       BACKUP_POLL_SECONDS            - optional, default 5
+       BACKUP_DEBOUNCE_SECONDS        - optional, default 8
+       MAX_BACKUP_INTERVAL_MINUTES    - optional safety-net ceiling, default 30
+
+  On startup, and every time it connects, the bot posts a "connected"
+  message into the backup group so you can always tell which group is
+  wired up.
 
 Usage:
   python3 backup.py restore   # one-shot, run at container startup
-  python3 backup.py loop      # runs forever, backs up every N minutes
+  python3 backup.py watch     # runs forever, backs up on change (debounced)
   python3 backup.py once      # one-shot manual backup
 """
 import io
@@ -36,7 +49,9 @@ import urllib.request
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GROUP_ID = os.environ.get("TELEGRAM_BACKUP_GROUP_ID")
-INTERVAL_MINUTES = float(os.environ.get("BACKUP_INTERVAL_MINUTES", "20"))
+POLL_SECONDS = float(os.environ.get("BACKUP_POLL_SECONDS", "5"))
+DEBOUNCE_SECONDS = float(os.environ.get("BACKUP_DEBOUNCE_SECONDS", "8"))
+MAX_INTERVAL_MINUTES = float(os.environ.get("MAX_BACKUP_INTERVAL_MINUTES", "30"))
 NOTIFY_USER_ID = os.environ.get("TELEGRAM_ALLOWED_USER_ID")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -73,6 +88,40 @@ def notify(text):
         log(f"notify failed: {e}")
 
 
+_warned = set()
+
+
+def notify_once(key, text):
+    """Send a Telegram warning at most once per run for a given issue -
+    everything else (including repeats of the same issue) just goes to
+    the log, so the bot chat doesn't get flooded with repeated
+    background-backup errors."""
+    if key in _warned:
+        log(text)
+        return
+    _warned.add(key)
+    log(text)
+    notify(text)
+
+
+def announce_connected():
+    """Posts a message into the backup group so it's always obvious which
+    group is wired up. Runs on every startup (called from restore_backup)."""
+    if not (BOT_TOKEN and GROUP_ID):
+        return
+    try:
+        api_call("sendMessage", {
+            "chat_id": GROUP_ID,
+            "text": (
+                "\U0001F517 Agyy connected to this group for backups. "
+                "Workspace + agy login/config will be backed up here "
+                "automatically whenever something changes."
+            ),
+        })
+    except Exception as e:
+        log(f"could not announce connection in group (wrong chat id, or bot not a member?): {e}")
+
+
 def build_archive():
     """Tar up the workspace plus every dotfile/dotdir directly under
     /root - this catches agy's login/session state and this app's own
@@ -100,8 +149,11 @@ def send_backup():
     data = build_archive()
     size_mb = len(data) / (1024 * 1024)
     if size_mb > 45:
-        log(f"backup is {size_mb:.1f}MB - too close to Telegram's 50MB bot upload limit, skipping.")
-        notify(f"Backup skipped: archive is {size_mb:.1f}MB, over the safe size limit.")
+        notify_once(
+            "size",
+            f"Backup skipped: archive is {size_mb:.1f}MB, over the safe size limit. "
+            "(This won't be repeated in chat - check logs for further occurrences.)",
+        )
         return False
 
     boundary = "----agyybackupboundary"
@@ -133,11 +185,11 @@ def send_backup():
             "chat_id": GROUP_ID, "message_id": message_id, "disable_notification": True,
         })
     except Exception as e:
-        log(f"pinChatMessage failed (bot needs 'Pin messages' admin right in the group): {e}")
-        notify(
+        notify_once(
+            "pin",
             "Backup uploaded but could NOT be pinned - make the bot an admin "
             "with 'Pin messages' in the backup group, or restore will fail "
-            "after the next redeploy."
+            f"after the next redeploy. ({e})",
         )
 
     log(f"backup uploaded ({size_mb:.2f}MB).")
@@ -148,6 +200,8 @@ def restore_backup():
     if not (BOT_TOKEN and GROUP_ID):
         log("TELEGRAM_BACKUP_GROUP_ID or TELEGRAM_BOT_TOKEN not set - skipping restore.")
         return False
+
+    announce_connected()
 
     try:
         chat = api_call("getChat", {"chat_id": GROUP_ID})
@@ -182,21 +236,92 @@ def restore_backup():
     return True
 
 
-def loop():
-    log(f"backup loop starting - every {INTERVAL_MINUTES} minutes.")
+def snapshot():
+    """Lightweight signature (path -> mtime, size) of everything
+    build_archive() would tar up. Cheap enough to poll every few
+    seconds; any add/edit/delete anywhere in it changes the signature -
+    including agy writing its login/session files the moment a login
+    completes, so login is backed up automatically too, not just files."""
+    sig = {}
+
+    def add_dir(path):
+        for dirpath, _dirs, files in os.walk(path):
+            for f in files:
+                fp = os.path.join(dirpath, f)
+                try:
+                    st = os.stat(fp)
+                    sig[fp] = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    pass
+
+    if os.path.isdir(WORKSPACE):
+        add_dir(WORKSPACE)
+    try:
+        names = sorted(os.listdir(ROOT))
+    except OSError:
+        names = []
+    for name in names:
+        if name == "workspace" or name in SKIP_NAMES:
+            continue
+        if name.startswith(".") or name == "auth_blocklist.json":
+            path = os.path.join(ROOT, name)
+            if os.path.isdir(path):
+                add_dir(path)
+            else:
+                try:
+                    st = os.stat(path)
+                    sig[path] = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    pass
+    return sig
+
+
+def watch():
+    """Backs up as soon as something changes (debounced so a burst of
+    writes triggers one backup, not dozens), instead of on a fixed
+    timer - so a redeploy can only ever lose the last few seconds of
+    work. MAX_INTERVAL_MINUTES is just a safety net in case a change is
+    ever somehow missed by the poll."""
+    log(
+        f"watching for changes every {POLL_SECONDS}s, backing up "
+        f"{DEBOUNCE_SECONDS}s after things settle "
+        f"(safety-net backup at least every {MAX_INTERVAL_MINUTES} min)."
+    )
+    last_backed_up_sig = snapshot()
+    last_seen_sig = last_backed_up_sig
+    last_change_time = None
+    last_backup_time = time.time()
+
     while True:
-        time.sleep(INTERVAL_MINUTES * 60)
+        time.sleep(POLL_SECONDS)
         try:
-            send_backup()
+            sig = snapshot()
         except Exception as e:
-            log(f"backup failed: {e}")
+            log(f"snapshot failed: {e}")
+            continue
+
+        if sig != last_seen_sig:
+            last_seen_sig = sig
+            last_change_time = time.time()
+
+        pending_change = last_seen_sig != last_backed_up_sig
+        settled = last_change_time is not None and (time.time() - last_change_time) >= DEBOUNCE_SECONDS
+        overdue = (time.time() - last_backup_time) >= MAX_INTERVAL_MINUTES * 60
+
+        if (pending_change and settled) or (pending_change and overdue):
+            try:
+                if send_backup():
+                    last_backed_up_sig = last_seen_sig
+                    last_backup_time = time.time()
+            except Exception as e:
+                log(f"backup failed: {e}")
 
 
 if __name__ == "__main__":
-    action = sys.argv[1] if len(sys.argv) > 1 else "loop"
+    action = sys.argv[1] if len(sys.argv) > 1 else "watch"
     if action == "restore":
         restore_backup()
     elif action == "once":
         send_backup()
     else:
-        loop()
+        watch()
