@@ -21,8 +21,8 @@ pull_data() {
 
 push_data() {
     echo "Pushing data to Google Drive..."
-    rclone copy -L /root/workspace "${REMOTE_NAME}:workspace" --exclude "project_code/**" || true
-    rclone copy -L /root/.gemini "${REMOTE_NAME}:.gemini" || true
+    rclone sync -L /root/workspace "${REMOTE_NAME}:workspace" --exclude "project_code/**" || true
+    rclone sync -L /root/.gemini "${REMOTE_NAME}:.gemini" || true
     if [ -f /root/blocklist.json ]; then
         rclone copy /root/blocklist.json "${REMOTE_NAME}:blocklist.json" || true
     fi
