@@ -1,3 +1,9 @@
+# जर RCLONE_CONFIG_BASE64 रिकामे असेल तर बॅकअप पूर्ण बायपास करा
+if [ -z "$RCLONE_CONFIG_BASE64" ]; then
+    echo "No rclone config found. Skipping backup and drive sync entirely."
+    exit 0
+fi
+
 #!/bin/bash
 set -e
 
