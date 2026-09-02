@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y \
     ttyd \
     python3 \
     nginx \
+    unzip \
+    fuse3 \
+    && curl -fsSL https://rclone.org/install.sh | bash \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root
@@ -25,7 +28,8 @@ COPY nginx.conf /root/nginx.conf
 COPY url_watcher.py /root/url_watcher.py
 COPY oauth_link.html /root/oauth_link.html
 COPY telegram_bot.py /root/telegram_bot.py
-RUN chmod +x /root/entrypoint.sh /root/auth_gate.py /root/url_watcher.py /root/telegram_bot.py
+COPY sync.sh /root/sync.sh
+RUN chmod +x /root/entrypoint.sh /root/auth_gate.py /root/url_watcher.py /root/telegram_bot.py /root/sync.sh
 
 # NOTE: Koyeb's free tier has no persistent volume, so the container's
 # local filesystem is wiped on every redeploy/restart. There is no

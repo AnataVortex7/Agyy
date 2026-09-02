@@ -4,6 +4,13 @@ set -e
 mkdir -p /root/workspace
 export HOME=/root
 export PATH="/root/.local/bin:${PATH}"
+
+# Pull data from Google Drive before starting services
+/root/sync.sh pull
+
+# Start background sync loop
+/root/sync.sh loop &
+
 cd /root/workspace
 
 # 1) nginx: multiplexes the single public port (8000) between the
