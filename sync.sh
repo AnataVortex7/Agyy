@@ -3,13 +3,19 @@ set -e
 
 # Setup rclone config using Environment Variable
 mkdir -p /root/.config/rclone
-if [ -n "$RCLONE_CONF_CONTENT" ]; then
+# Setup rclone config using Environment Variable
+mkdir -p /root/.config/rclone
+if [ -n "$RCLONE_CONF_BASE64" ]; then
+    echo "Creating rclone config from base64 variable..."
+    echo "$RCLONE_CONF_BASE64" | base64 -d > /root/.config/rclone/rclone.conf
+elif [ -n "$RCLONE_CONF_CONTENT" ]; then
     echo "Creating rclone config from environment variable..."
     echo "$RCLONE_CONF_CONTENT" > /root/.config/rclone/rclone.conf
 else
-    echo "ERROR: RCLONE_CONF_CONTENT environment variable is not set."
+    echo "ERROR: Neither RCLONE_CONF_BASE64 nor RCLONE_CONF_CONTENT is set."
     echo "Sync will not work without Google Drive config."
 fi
+
 
 REMOTE_NAME="gdrive"
 if [ -f /root/.config/rclone/rclone.conf ]; then
