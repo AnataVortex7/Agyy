@@ -11,7 +11,7 @@ else
     echo "Sync will not work without Google Drive config."
 fi
 
-REMOTE_NAME="gdrive"
+REMOTE_NAME="gdrive1"
 if [ -f /root/.config/rclone/rclone.conf ]; then
     EXTRACTED_NAME=$(grep -o '^\[.*\]$' /root/.config/rclone/rclone.conf | head -n 1 | tr -d '[]')
     if [ -n "$EXTRACTED_NAME" ]; then
