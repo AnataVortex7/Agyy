@@ -9,7 +9,6 @@ if [ -n "$SA_KEY_BASE64" ]; then
     echo "$SA_KEY_BASE64" | base64 -d > /root/sa.json
 fi
 
-# Folder ID Environment Variable मधून घ्या किंवा डिफॉल्ट वापरा
 ROOT_FOLDER_ID="${GDRIVE_ROOT_ID:-1US7h00XWr9FDT_5i7U0BpNsRtPa0DgMM}"
 REMOTE_NAME="gdrive"
 
@@ -26,18 +25,21 @@ echo "Using remote name: ${REMOTE_NAME}"
 # Function to pull data from Drive
 pull_data() {
     echo "Pulling data from Google Drive..."
-    rclone copy "${REMOTE_NAME}:workspace" /root/workspace
-    rclone copy "${REMOTE_NAME}:.gemini" /root/.gemini
-    rclone copy "${REMOTE_NAME}:blocklist.json" /root/blocklist.json
+    rclone copy "${REMOTE_NAME}:workspace" /root/workspace || true
+    rclone copy "${REMOTE_NAME}:.gemini" /root/.gemini || true
+    # blocklist नसेल तरी क्रॅश होऊ नये म्हणून:
+    rclone copy "${REMOTE_NAME}:blocklist.json" /root/blocklist.json || true
     echo "Pull complete."
 }
 
-# Function to push data to Drive (Data loss टाळण्यासाठी copy वापरले आहे)
+# Function to push data to Drive
 push_data() {
     echo "Pushing data to Google Drive..."
-    rclone copy /root/workspace "${REMOTE_NAME}:workspace" --exclude "project_code/**"
-    rclone copy /root/.gemini "${REMOTE_NAME}:.gemini"
-    rclone copy /root/blocklist.json "${REMOTE_NAME}:blocklist.json"
+    rclone copy /root/workspace "${REMOTE_NAME}:workspace" --exclude "project_code/**" || true
+    rclone copy /root/.gemini "${REMOTE_NAME}:.gemini" || true
+    if [ -f /root/blocklist.json ]; then
+        rclone copy /root/blocklist.json "${REMOTE_NAME}:blocklist.json" || true
+    fi
     echo "Push complete."
 }
 
