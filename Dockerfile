@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     python3 \
     nginx \
     unzip \
-    fuse3 \
+    
     && curl -fsSL https://rclone.org/install.sh | bash \
     && rm -rf /var/lib/apt/lists/*
 
